@@ -112,7 +112,7 @@ unsigned long ioremap_bot = IOREMAP_BASE;
  * __ioremap_at - Low level function to establish the page tables
  *                for an IO mapping
  */
-void __iomem *__ioremap_at(phys_addr_t pa, void *ea, unsigned long size, pgprot_t prot)
+static void __iomem * hash__ioremap_at(phys_addr_t pa, void *ea, unsigned long size, pgprot_t prot)
 {
 	unsigned long i;
 
@@ -120,6 +120,50 @@ void __iomem *__ioremap_at(phys_addr_t pa, void *ea, unsigned long size, pgprot_
 	if (pgprot_val(prot) & H_PAGE_4K_PFN)
 		return NULL;
 
+	for (i = 0; i < size; i += PAGE_SIZE)
+		if (map_kernel_page((unsigned long)ea + i, pa + i, prot))
+			return NULL;
+
+	return (void __iomem *)ea;
+}
+
+static int radix__ioremap_page_range(unsigned long addr, unsigned long end,
+		       phys_addr_t phys_addr, pgprot_t prot)
+{
+	while (addr != end) {
+		if (!(addr & ~PUD_MASK) && !(phys_addr & ~PUD_MASK) &&
+				end - addr >= PUD_SIZE) {
+			if (radix__map_kernel_page(addr, phys_addr, prot, PUD_SIZE))
+				return -ENOMEM;
+			addr += PUD_SIZE;
+			phys_addr += PUD_SIZE;
+
+		} else if (!(addr & ~PMD_MASK) && !(phys_addr & ~PMD_MASK) &&
+				end - addr >= PMD_SIZE) {
+			if (radix__map_kernel_page(addr, phys_addr, prot, PMD_SIZE))
+				return -ENOMEM;
+			addr += PMD_SIZE;
+			phys_addr += PMD_SIZE;
+
+		} else {
+			if (radix__map_kernel_page(addr, phys_addr, prot, PAGE_SIZE))
+				return -ENOMEM;
+			addr += PAGE_SIZE;
+			phys_addr += PAGE_SIZE;
+		}
+	}
+	return 0;
+}
+
+static void __iomem * radix__ioremap_at(phys_addr_t pa, void *ea, unsigned long size, pgprot_t prot)
+{
+	if (radix__ioremap_page_range((unsigned long)ea, (unsigned long)ea + size, pa, prot))
+		return NULL;
+	return ea;
+}
+
+void __iomem *__ioremap_at(phys_addr_t pa, void *ea, unsigned long size, pgprot_t prot)
+{
 	if ((ea + size) >= (void *)IOREMAP_END) {
 		pr_warn("Outside the supported range\n");
 		return NULL;
@@ -129,11 +173,9 @@ void __iomem *__ioremap_at(phys_addr_t pa, void *ea, unsigned long size, pgprot_
 	WARN_ON(((unsigned long)ea) & ~PAGE_MASK);
 	WARN_ON(size & ~PAGE_MASK);
 
-	for (i = 0; i < size; i += PAGE_SIZE)
-		if (map_kernel_page((unsigned long)ea + i, pa + i, prot))
-			return NULL;
-
-	return (void __iomem *)ea;
+	if (radix_enabled())
+		return radix__ioremap_at(pa, ea, size, prot);
+	return hash__ioremap_at(pa, ea, size, prot);
 }
 
 /**
